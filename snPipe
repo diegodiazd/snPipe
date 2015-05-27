@@ -1,0 +1,334 @@
+#!/usr/bin/python
+import subprocess
+import os
+import sys, errno
+import argparse
+from os import listdir
+from os.path import isfile, join
+import re
+import shutil
+from collections import Counter
+
+# Run external programs
+def run_program(params):
+
+	try:
+ 		grepOut = subprocess.check_output(" ".join(params), shell=True)                       
+	except subprocess.CalledProcessError as grepexc:                                                                                                   
+    		print "snPipe: error: problems trying to run %s, error code: %d" % (params[0],grepexc.returncode)
+		sys.exit(1)
+
+# Function to check if a tool is available to execute it 
+def is_tool(name):
+
+	try:
+		devnull = open(os.devnull)
+        	subprocess.Popen([name], stdout=devnull, stderr=devnull).communicate()
+	except OSError as e:
+		if e.errno == os.errno.ENOENT:
+			return False
+	return True
+
+# Remove duplicated reads from bam files
+def rem_dup(out_path,query_genomes):
+	samples = []
+	for i in range(0,len(query_genomes)):
+		name = query_genomes[i][0]		
+		print "snPipe: converting "+name+".sam to bam format .."
+		input_sam = out_path+"/mapping/"+name+".sam"
+		out_bam = out_path+"/mapping/"+name+".bam"
+		run_program(["samtools" ,"view" ,"-bS", input_sam,">",out_bam])
+		print "snPipe: OK"
+		rdup_bam = out_path+"/mapping/"+name+"_rdup.bam"
+		print "snPipe: removing duplicated reads for "+name+".bam .."
+		# Run remove duplicated reads
+		if query_genomes[i][2] == "paired":
+			run_program(["samtools" ,"rmdup" ,"-S", out_bam,rdup_bam])
+		
+		else:
+			run_program(["samtools" ,"rmdup" ,"-s", out_bam,rdup_bam])
+		print "snPipe: OK"
+		f1.write(name+"\tOK")
+
+
+# Map reads
+def map_reads(out_path,query_genomes,ref_genome):
+
+	samples = []
+	# Count the number of libraries per sample
+	for i in range(0,len(query_genomes)):
+		tmp = query_genomes[i]		
+		samples.append(query_genomes[i])
+
+	counts = dict()
+	for i in samples:	
+		counts[i[0]] = counts.get(i[0], 0) + 1
+
+	print "snPipe: Creating directory for mapping files .."
+	if not os.path.exists(out_path+"/mapping"):		
+		os.makedirs(out_path+"/mapping")
+	print "snPipe: OK"
+	print "snPipe: Mapping reads of query genomes against reference genome .."
+	for i in range(0,len(query_genomes)):
+		tmp = query_genomes[i]
+		
+		name=""
+		# add a value if there are more than one library per sample	
+		if counts.get(tmp[0]) > 1:
+			name=tmp[0]+"."+str(counts.get(tmp[0]))
+			counts[tmp[0]] = counts.get(tmp[0])-1
+		else:
+			name=tmp[0]
+		
+		if tmp[len(tmp)-1]=="single": 
+			query_mapping = ['bwa','mem',ref_genome,tmp[1],">",out_path+"/mapping/"+name+".sam"]
+			print " ".join(query_mapping)
+		else:
+			query_mapping = ['bwa','mem',ref_genome,tmp[1],tmp[2],">",out_path+"/mapping/"+name+".sam"]
+			print " ".join(query_mapping)
+
+		print "Mapping genome query %s .."% tmp[0]
+		run_program(query_mapping)
+		f1.write(str(tmp[0])+"\tOK")
+	print "snPipe: OK"
+	
+
+# Handle command line arguments for snPipe
+parser = argparse.ArgumentParser(description='snPipe: this script is a wrapper of several tools to perform SNP calling. It takes a set of fastq files of different related genomes and finds SNPs respect to a reference genome.', epilog="Written by Diego Diaz (diego.diaz@umayor.cl), Centro de Genomica y Bioinformatica (CGYB).Released under the terms of the GNU General Public License v3.") 
+
+parser.add_argument('-bi','--build_index',dest='BUILD_INDEX', action='store_true', default=False,help="flag to build bwa index of the reference genome from FASTA file of -r option.")
+parser.add_argument('-rev','--recovery',dest='BUILD_INDEX', action='store_true', default=False,help="this options snPipe reads the log file stored in the output folder and tries to restart the pipeline from the last checkpoint.")
+parser.add_argument('genome_reference', help="fasta file with the sequence of the reference genome.")
+parser.add_argument('input', help="input file with the description of the query genomes. This file must contain 3 columns, the strain name, a comma-sepparated list with the path to the fastq files and the library type (only \"single\" or \"paired\" are allowed).")
+parser.add_argument('output', help="output folder where the SNP files (VCF format) will be stored.")
+
+# Throw help message if there are no arguments
+if len(sys.argv) < 2:
+    parser.print_help()
+    sys.exit(0)
+
+args = parser.parse_args()
+if_path = args.input
+out_path = args.output
+ref_genome = args.genome_reference
+build_index = args.BUILD_INDEX
+
+print "snPipe: checking input files .."
+
+# Throw message if there are nor input
+if not if_path:
+	print "snPipe: error: you must enter the input file"
+	sys.exit(1)
+
+if not ref_genome:
+	print "snPipe: error: you must enter for the refenrce genome either the FASTA sequence (-r) or bwa index (-gindex)"
+	sys.exit(1)
+
+if not out_path:
+	print "snPipe: error: you must enter a output folder"
+	sys.exit(1)
+	
+
+# Read the input file containing the strains names and their fastq files
+if not os.path.exists(if_path):
+	print "snPipe: error: the \"%s\" file does not exist" % if_path
+	sys.exit(errno.ENOENT)
+
+if os.path.isdir(if_path):
+	print "snPipe: error: \"%s\" is a directory, not a file" % if_path
+	sys.exit(errno.EISDIR)
+
+# Check if the reference genome is a file, not a directory
+if os.path.isdir(ref_genome):
+	print "snPipe: error: \"%s\" is a directory, not a file" % if_path
+	sys.exit(errno.EISDIR)
+
+
+# Open input file
+with open(if_path) as f:
+	content = f.readlines()
+
+query_genomes = [] 
+
+# Check sanity of the input file
+for i, item in enumerate(content):
+	str_arg = [] # final list of the current strain
+	line = content[i].rstrip("\n")
+	tmp = line.split("\t")
+	# All rows in the input file must to have three fields
+	if not len(tmp)==3:
+		print "snPipe: error: input file seems to be malformed, line %d in \"%s\"." %(i+1, if_path)
+		sys.exit(errno.EBADF)
+	# Check if the library type is correct
+	if tmp[2] != "paired" and tmp[2] != "single":
+		print "snPipe: error: unknown library type \"%s\" for %s, at line %d in input \"%s\"." % (tmp[2],tmp[0],(i+1),if_path)
+		sys.exit(errno.EBADF)				
+
+	# If the library is paired, the number of libraries has to be even
+	libs = tmp[1].split(",")
+	nlibs = len(libs)
+	if tmp[2]=="paired" and nlibs!=2:
+		print "snPipe: error: incorrect number of files for paired library in %s, line %d. Number of paired files: %d in \"%s\"." % (tmp[0], (i+1), nlibs, if_path)
+		sys.exit(errno.EBADF)
+
+	else:
+		if tmp[2]=="paired":
+			# Check if paired fastq files have the same name
+			k = 0
+			while k < nlibs:
+		
+				l1 = libs[k]
+				l1 = l1.split("/")
+				l1 = l1[len(l1)-1]
+				l1 = l1.replace(".gz","")
+				l1 = l1.replace(".fastq","")
+				l1 = l1.replace("_1","")
+				l1 = l1.replace(".1","")
+				l1 = l1.replace("-1","")
+				l1 = l1.replace("-forward","")
+				l1 = l1.replace("_forward","")
+				l1 = l1.replace(".forward","")
+				l1 = l1.replace("forward","")
+				l1 = l1.replace("_f","")
+				l1 = l1.replace("-f","")
+				l1 = l1.replace(".f","")
+		
+				l2 = libs[k+1]
+				l2 = l2.split("/")
+				l2 = l2[len(l2)-1]
+				l2 = l2.replace(".gz","")
+                		l2 = l2.replace(".fastq","")
+                		l2 = l2.replace("_2","")
+                		l2 = l2.replace(".2","")
+                		l2 = l2.replace("-2","")
+				l2 = l2.replace("-reverse","")
+                		l2 = l2.replace("_reverse","")
+                		l2 = l2.replace(".reverse","")
+                		l2 = l2.replace("reverse","")
+                		l2 = l2.replace("_r","")
+                		l2 = l2.replace("-r","")
+                		l2 = l2.replace(".r","")
+				k = k+2
+		
+				if l1 != l2:
+					print "snPipe: error: bad name for paired end library, strain \"%s\", line %d in \"%s\". Fastq files belonging to the same paired library have to have same name and must be in forward-reverse or 1-2 order." % (tmp[0],i+1,if_path)
+					sys.exit(errno.EBADF)
+	
+	if tmp[2]=="single" and nlibs!=1:
+		print "snPipe: error: incorrect number of files for single end library in %s, line %d. Number of paired files: %d in \"%s\"." % (tmp[0], (i+1), nlibs, if_path)
+		sys.exit(errno.EBADF)				
+
+	# Add the name of the strain to the final list of current strain
+	str_arg.append(tmp[0])
+	# Check if fastq files exist
+	for j in range(0,nlibs):
+		libs[j] = libs[j].strip()
+		if not os.path.exists(libs[j]):
+			print "snPipe: error: fastq file \"%s\" for %s does not exist, line %d in \"%s\"." % (libs[j], tmp[0], (i+1), if_path)
+			sys.exit(errno.ENOENT)
+
+		if os.path.isdir(libs[j]):
+			print "snPipe: error: library \"%s\" for %s seems to be a folder, line %d in \"%s\"." % (libs[j],tmp[0],(i+1), if_path)
+			sys.exit(errno.EISDIR)
+		# Add checked fastq files to the final list of the current strain
+		str_arg.append(libs[j])
+
+	# Finally add the library type to the final list of the current strain
+	str_arg.append(tmp[2])
+	query_genomes.append(str_arg)
+	#print str_arg
+
+
+
+print "snPipe: OK"
+
+is_tool("bwa")
+
+# Create output directory
+if not os.path.exists(out_path):
+    os.makedirs(out_path)	
+
+f1=open(out_path+'/snPipe.log', 'w+')
+f1.write("snPipe LOG\n")
+f1.write("VARIABLES:\n")
+f1.write("Output path:\t"+out_path+"\n")
+f1.write("Input file:\t"+if_path+"\n")
+f1.write("Samples:\n")
+for i in range(0, len(query_genomes)):
+
+	f1.write(str(",".join(query_genomes[i]))+"\n")
+	
+f1.write("build index:\t"+str(build_index)+"\n")
+
+
+# Check if index file has to be built
+
+if not build_index:
+	print "snPipe: create bwa index for reference genome? no .."
+	p_ref_genome = os.path.abspath(os.path.join(ref_genome, os.pardir))	
+	onlyfiles = [f for f in listdir(p_ref_genome) if isfile(join(p_ref_genome,f)) ]	
+	cont =0
+	for i in range(0,len(onlyfiles)):
+		if re.search('.bwt$',onlyfiles[i]):
+			cont=cont+1
+		if re.search('.ann$',onlyfiles[i]):
+			cont=cont+1
+		if re.search('.sa$',onlyfiles[i]):
+			cont=cont+1
+		if re.search('.pac$',onlyfiles[i]):
+			cont=cont+1
+		if re.search('.amb$',onlyfiles[i]):
+			cont=cont+1
+		if re.search('.fa$',onlyfiles[i]):
+			cont=cont+1
+	if cont != 5:
+		print "snPipe: error: some files of the genome index are missing"
+		sys.exit(1)
+
+	# Map reads of query genomes against reference genome
+	f1.write("PROCESS:\tMAP READS AGAINST REFERENCE\n")
+	map_reads(out_path,query_genomes,ref_genome)
+
+else:
+	# If -bi options is true, then make genome index
+	print "snPipe: create bwa index for reference genome? yes .."
+	if build_index and ref_genome:
+		# Check if FASTA file with the DNA sequences of the reference genome is well formed.
+		handle = open(ref_genome, "rU")		
+		line = handle.readline()
+		if not line.startswith(">"):
+			print "snPipe: error: malformed FASTA file for reference genome"
+			sys.exit(1)
+				
+		# Make index of the reference
+		f1.write("PROCESS:\tBUILD BWA INDEX\n")
+		print "snPipe: creating a folder for the bwa index in the output folder .."
+		if not os.path.exists(out_path+"/bwa_index"):		
+			os.makedirs(out_path+"/bwa_index")
+		print "snPipe: OK"
+		print "snPipe: making a copy of reference genome into the bwa index folder .."
+		name = ref_genome.split("/")		
+		shutil.copyfile(ref_genome,out_path+"/bwa_index/"+name[len(name)-1])		
+		print "snPipe: OK"
+		print "snPipe: making bwa index for %s .." % (out_path+"/bwa_index/"+name[len(name)-1])	
+		m_index = ['bwa','index',out_path+"/bwa_index/"+name[len(name)-1]]				
+		run_program(m_index) 	
+		print "snPipe: OK"
+		f1.write("BUILD BWA INDEX\tOK\n")
+		f1.write("BWA INDEX PATH\t"+out_path+"/bwa_index/"+name[len(name)-1]+"\n")
+		# Map reads of query genomes against reference genome
+		f1.write("PROCESS:\tMAP READS AGAINST REFERENCE\n")
+		map_reads(out_path,query_genomes,out_path+"/bwa_index/"+name[len(name)-1])
+
+
+# Convert to BAM, remove duplicated reads from BAM files
+print "snPipe: removing duplicated reads from bam files .."
+is_tool("samtools")
+f1.write("REMOVE DUPLICATED READS")
+rem_dup(out_path,query_genomes)
+
+# Make SNP calling
+print "snPipe: make SNP calling from bams"
+
+
+f1.close()
